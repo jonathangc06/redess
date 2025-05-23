@@ -7,6 +7,7 @@ import os
 import wave
 from datetime import datetime
 import struct
+import time
 
 # Configuración de audio y red
 CHUNK = 1024
@@ -16,10 +17,9 @@ RATE = 44100
 PORT = 50007
 BUFFER_SIZE = 4096
 
-# Función para obtener la IP local de la interfaz activa
+# Obtener IP local y broadcast
 def get_local_ip():
     try:
-        # Conectamos a un host público para obtener la IP local asignada (sin enviar datos)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
@@ -28,50 +28,41 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
-# Función para calcular la dirección de broadcast dado IP y máscara
 def ip_broadcast(ip, netmask):
     ip_packed = struct.unpack('>I', socket.inet_aton(ip))[0]
     mask_packed = struct.unpack('>I', socket.inet_aton(netmask))[0]
     broadcast_packed = ip_packed | (~mask_packed & 0xFFFFFFFF)
-    broadcast_ip = socket.inet_ntoa(struct.pack('>I', broadcast_packed))
-    return broadcast_ip
+    return socket.inet_ntoa(struct.pack('>I', broadcast_packed))
 
-# Función para obtener máscara de red de la interfaz usada para la IP local
-def get_netmask(local_ip):
-    # Este método es más simple y funciona en Windows y Linux para interfaces estándar
-    # Usaremos getaddrinfo para la IP local y sacamos máscara de red con socket.if_nameindex y si lo permite
-    # Pero para simplificar, usaremos máscara común de clase C: 255.255.255.0
-    # Puedes mejorar esta parte usando librerías como netifaces si quieres más precisión
+def get_netmask(_):
     return "255.255.255.0"
 
-# Obtener IP local y broadcast automático
 local_ip = get_local_ip()
 netmask = get_netmask(local_ip)
 TARGET_IP = ip_broadcast(local_ip, netmask)
-print(f"IP local detectada: {local_ip}")
-print(f"Máscara de red asumida: {netmask}")
-print(f"Dirección broadcast calculada: {TARGET_IP}")
 
-# Inicializar PyAudio y sockets
+print(f"IP local: {local_ip}")
+print(f"Broadcast: {TARGET_IP}")
+
+# Inicialización de audio y red
 audio = pyaudio.PyAudio()
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 sock.bind(('', PORT))
 
-# Streams
 stream_input = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 stream_output = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, frames_per_buffer=CHUNK)
 
-# Carpeta de almacenamiento
+# Directorio de mensajes
 DIRECTORIO_MENSAJES = "mensajes_recibidos"
 os.makedirs(DIRECTORIO_MENSAJES, exist_ok=True)
 
-# Estado
+# Variables globales
 transmitting = False
-current_record = []
 running = True
+current_record = []
 
-# Guardar mensaje como archivo WAV
+# Guardar mensaje en .wav
 def guardar_mensaje(frames):
     nombre = f"mensaje_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
     ruta = os.path.join(DIRECTORIO_MENSAJES, nombre)
@@ -82,37 +73,45 @@ def guardar_mensaje(frames):
         wf.writeframes(b''.join(frames))
     return nombre
 
-# Transmisión de voz
-def transmit_audio():
-    global transmitting
-    while transmitting and running:
-        try:
-            data = stream_input.read(CHUNK)
-            sock.sendto(data, (TARGET_IP, PORT))
-        except Exception as e:
-            print(f"Error al transmitir: {e}")
-            break
-
-# Recepción de voz y almacenamiento
-def receive_audio():
-    global current_record
-    while running:
-        try:
-            data, addr = sock.recvfrom(BUFFER_SIZE)
-            stream_output.write(data)
-            current_record.append(data)
-        except Exception as e:
-            if running:
-                print(f"Error al recibir audio: {e}")
-            break
-
-# Finalizar grabación y guardar
 def guardar_si_hay_audio():
     global current_record
     if current_record:
         nombre = guardar_mensaje(current_record)
         mensajes_listbox.insert(tk.END, nombre)
         current_record = []
+
+# Transmitir voz
+def transmit_audio():
+    global transmitting
+    while transmitting and running:
+        try:
+            data = stream_input.read(CHUNK, exception_on_overflow=False)
+            sock.sendto(data, (TARGET_IP, PORT))
+        except Exception as e:
+            print(f"Error transmitiendo: {e}")
+            break
+
+# Recibir voz (y guardar)
+def receive_audio():
+    global current_record
+    while running:
+        try:
+            data, addr = sock.recvfrom(BUFFER_SIZE)
+            if addr[0] == local_ip:
+                continue  # Ignora el audio propio
+
+            stream_output.write(data)
+            current_record.append(data)
+        except Exception as e:
+            if running:
+                print(f"Error al recibir: {e}")
+            break
+
+# Guardar periódicamente lo recibido
+def guardar_periodicamente():
+    while running:
+        time.sleep(5)
+        guardar_si_hay_audio()
 
 # Alternar transmisión
 def toggle_transmit(event):
@@ -149,15 +148,15 @@ def reproducir_mensaje():
             stream.stop_stream()
             stream.close()
     except Exception as e:
-        messagebox.showerror("Error", f"No se pudo reproducir el mensaje: {e}")
+        messagebox.showerror("Error", f"No se pudo reproducir: {e}")
 
-# Al cerrar la ventana
+# Al cerrar ventana
 def on_closing():
     global running, transmitting
     running = False
     transmitting = False
     try:
-        sock.close()  # cerrar socket para desbloquear recvfrom
+        sock.close()
     except:
         pass
     stream_input.stop_stream()
@@ -167,7 +166,7 @@ def on_closing():
     audio.terminate()
     root.destroy()
 
-# GUI
+# Interfaz
 root = tk.Tk()
 root.title("Walkie LAN con mensajes guardados")
 
@@ -185,16 +184,14 @@ mensajes_listbox.pack(pady=5)
 btn_reproducir = tk.Button(frame, text="Reproducir Mensaje Seleccionado", command=reproducir_mensaje)
 btn_reproducir.pack(pady=5)
 
-# Cargar mensajes existentes
+# Cargar mensajes previos
 for archivo in sorted(os.listdir(DIRECTORIO_MENSAJES)):
     if archivo.endswith(".wav"):
         mensajes_listbox.insert(tk.END, archivo)
 
-# Hilo de recepción
+# Hilos en segundo plano
 threading.Thread(target=receive_audio, daemon=True).start()
+threading.Thread(target=guardar_periodicamente, daemon=True).start()
 
-# Evento de cerrar ventana
 root.protocol("WM_DELETE_WINDOW", on_closing)
-
-# Ejecutar GUI
 root.mainloop()
